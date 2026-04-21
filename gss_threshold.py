@@ -15,6 +15,7 @@ are shown in a side-by-side comparison.
 Outputs: output/threshold/
 """
 
+import os
 import warnings
 import numpy as np
 import pandas as pd
@@ -28,13 +29,26 @@ DATA_PATH = "data/GSS.xlsx"
 OUT_DIR   = "output/threshold"
 THRESHOLD = 0.25    # P(not satisfied at all) at which we compute the income threshold
 
+os.makedirs(OUT_DIR, exist_ok=True)
+
 # ---------------------------------------------------------------------------
 # 1. Load and clean
 # ---------------------------------------------------------------------------
 
 print("Loading data…")
-df = pd.read_excel(DATA_PATH, sheet_name="Data")
+try:
+    df = pd.read_excel(DATA_PATH, sheet_name="Data")
+except ValueError as e:
+    raise SystemExit(
+        f"Could not read sheet 'Data' from {DATA_PATH}. "
+        f"Verify the sheet name matches exactly. Original error: {e}"
+    )
 df.columns = df.columns.str.strip().str.lower()
+
+REQUIRED_COLS = {"year", "wtssps", "coninc", "hompop", "satfin"}
+missing = REQUIRED_COLS - set(df.columns)
+if missing:
+    raise SystemExit(f"Missing required columns in {DATA_PATH}: {missing}")
 df["year"]   = pd.to_numeric(df["year"],   errors="coerce").astype("Int64")
 df["weight"] = pd.to_numeric(df["wtssps"], errors="coerce")
 df["coninc"] = pd.to_numeric(df["coninc"], errors="coerce")
@@ -42,7 +56,7 @@ df.loc[df["coninc"] <= 0, "coninc"] = np.nan
 
 def parse_hompop(val):
     s = str(val).strip()
-    if s.startswith("14"):
+    if s.startswith("14"):   # GSS top-codes "14 or more" persons in household as "14+"
         return 14.0
     try:
         return float(s)
@@ -53,8 +67,17 @@ df["hompop"]    = df["hompop"].apply(parse_hompop)
 df.loc[df["hompop"] <= 0, "hompop"] = np.nan
 df["coninc_eq"] = df["coninc"] / np.sqrt(df["hompop"])
 
-VALID_SATFIN    = {"Pretty well satisfied", "More or less satisfied", "Not satisfied at all"}
-df["satfin_clean"] = df["satfin"].where(df["satfin"].isin(VALID_SATFIN))
+_SATFIN_MAP = {
+    "pretty well satisfied": "Pretty well satisfied",
+    "more or less satisfied": "More or less satisfied",
+    "not satisfied at all": "Not satisfied at all",
+}
+_satfin_norm = df["satfin"].astype(str).str.strip().str.lower()
+unknown_satfin = {v for v in _satfin_norm.unique()
+                  if v not in _SATFIN_MAP and v not in {"nan", ""}}
+if unknown_satfin:
+    print(f"  Warning: unrecognized satfin values (will be dropped): {unknown_satfin}")
+df["satfin_clean"] = _satfin_norm.map(_SATFIN_MAP)
 df["dissatisfied"] = (df["satfin_clean"] == "Not satisfied at all").astype(float)
 
 df_base = df.dropna(subset=["year", "satfin_clean", "weight"]).copy()
@@ -102,6 +125,7 @@ def run_threshold_analysis(df_in, income_col):
         # b1 must be negative (higher income → lower dissatisfaction) and
         # the solution must be positive income
         if b1 >= 0:
+            print(f"  Warning: year {yr} has b1={b1:.4f} >= 0 (unexpected sign); threshold set to NaN")
             threshold_income = np.nan
         else:
             log_inc_threshold = (target_logodds - b0) / b1

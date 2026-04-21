@@ -18,6 +18,7 @@ Smoothing: ±2 calendar year centred window.
 Outputs: output/finrela_worst/
 """
 
+import os
 import warnings
 import numpy as np
 import pandas as pd
@@ -30,6 +31,8 @@ warnings.filterwarnings("ignore")
 DATA_PATH = "data/GSS.xlsx"
 OUT_DIR   = "output/finrela_worst"
 THRESHOLD = 0.25
+
+os.makedirs(OUT_DIR, exist_ok=True)
 TARGET_LOGODDS = np.log(THRESHOLD / (1 - THRESHOLD))   # ≈ -1.099
 
 # ---------------------------------------------------------------------------
@@ -37,8 +40,19 @@ TARGET_LOGODDS = np.log(THRESHOLD / (1 - THRESHOLD))   # ≈ -1.099
 # ---------------------------------------------------------------------------
 
 print("Loading data…")
-df = pd.read_excel(DATA_PATH, sheet_name="Data")
+try:
+    df = pd.read_excel(DATA_PATH, sheet_name="Data")
+except ValueError as e:
+    raise SystemExit(
+        f"Could not read sheet 'Data' from {DATA_PATH}. "
+        f"Verify the sheet name matches exactly. Original error: {e}"
+    )
 df.columns = df.columns.str.strip().str.lower()
+
+REQUIRED_COLS = {"year", "wtssps", "coninc", "hompop", "finrela"}
+missing = REQUIRED_COLS - set(df.columns)
+if missing:
+    raise SystemExit(f"Missing required columns in {DATA_PATH}: {missing}")
 df["year"]   = pd.to_numeric(df["year"],   errors="coerce").astype("Int64")
 df["weight"] = pd.to_numeric(df["wtssps"], errors="coerce")
 df["coninc"] = pd.to_numeric(df["coninc"], errors="coerce")
@@ -46,7 +60,7 @@ df.loc[df["coninc"] <= 0, "coninc"] = np.nan
 
 def parse_hompop(val):
     s = str(val).strip()
-    if s.startswith("14"):
+    if s.startswith("14"):   # GSS top-codes "14 or more" persons in household as "14+"
         return 14.0
     try:
         return float(s)
@@ -57,9 +71,19 @@ df["hompop"]    = df["hompop"].apply(parse_hompop)
 df.loc[df["hompop"] <= 0, "hompop"] = np.nan
 df["coninc_eq"] = df["coninc"] / np.sqrt(df["hompop"])
 
-VALID_FINRELA = {"FAR ABOVE AVERAGE", "ABOVE AVERAGE", "AVERAGE",
-                 "BELOW AVERAGE", "FAR BELOW AVERAGE"}
-df["finrela_clean"] = df["finrela"].where(df["finrela"].isin(VALID_FINRELA))
+_FINRELA_MAP = {
+    "far above average": "FAR ABOVE AVERAGE",
+    "above average":     "ABOVE AVERAGE",
+    "average":           "AVERAGE",
+    "below average":     "BELOW AVERAGE",
+    "far below average": "FAR BELOW AVERAGE",
+}
+_finrela_norm = df["finrela"].astype(str).str.strip().str.lower()
+unknown_finrela = {v for v in _finrela_norm.unique()
+                   if v not in _FINRELA_MAP and v not in {"nan", ""}}
+if unknown_finrela:
+    print(f"  Warning: unrecognized finrela values (will be dropped): {unknown_finrela}")
+df["finrela_clean"] = _finrela_norm.map(_FINRELA_MAP)
 df["below_avg"]     = df["finrela_clean"].isin(
     {"BELOW AVERAGE", "FAR BELOW AVERAGE"}
 ).astype(float)
@@ -103,6 +127,7 @@ def run_threshold_analysis(df_in, income_col):
 
         # Higher income → lower P(below average), so b1 should be negative
         if b1 >= 0:
+            print(f"  Warning: year {yr} has b1={b1:.4f} >= 0 (unexpected sign); threshold set to NaN")
             threshold_income = np.nan
         else:
             threshold_income = np.exp((TARGET_LOGODDS - b0) / b1)
@@ -112,6 +137,7 @@ def run_threshold_analysis(df_in, income_col):
         rows.append({
             "year":             int(yr),
             "threshold_income": threshold_income,
+            "mean_income":      np.average(vals, weights=wts),
             "median_income":    weighted_median(vals, wts),
             "n":                len(sub),
             "b0": b0, "b1": b1,
@@ -129,8 +155,15 @@ res_adj   = run_threshold_analysis(df_base, "coninc_eq")
 # ---------------------------------------------------------------------------
 
 def add_smooth(res, half_window=2):
+    """
+    Centred 5-calendar-year rolling average (±2 years).
+    For each survey year Y, averages over all survey waves where
+    Y - half_window <= wave_year <= Y + half_window.
+    Post-1994 biennial waves contribute fewer observations per window
+    than annual pre-1994 waves, but the calendar span is consistent.
+    """
     r = res.copy().sort_values("year").reset_index(drop=True)
-    for col in ["threshold_income", "median_income"]:
+    for col in ["threshold_income", "mean_income", "median_income"]:
         smoothed = []
         for yr in r["year"]:
             mask = (r["year"] >= yr - half_window) & (r["year"] <= yr + half_window)
